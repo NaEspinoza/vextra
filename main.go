@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"runtime"
+	"strings"
 )
 
 // version se fija en el build con -ldflags "-X main.version=...".
@@ -22,7 +23,7 @@ const (
 	exitVerify  = 4  // integridad: hash distinto o archivo cambió durante la copia
 	exitSafety  = 5  // abortado por salvaguarda (límite de borrados, sin confirmación)
 	exitPartial = 6  // terminó, pero algunos archivos fallaron
-	exitDiffs   = 10 // sólo `vx diff --exit-code`: hay diferencias
+	exitDiffs   = 10 // sólo "vx diff --exit-code": hay diferencias
 )
 
 var errDiffs = errors.New("hay diferencias")
@@ -77,6 +78,10 @@ func run(args []string, in io.Reader, stdout, stderr io.Writer) int {
 	default:
 		err = fmt.Errorf("%w: comando desconocido %q (probá: vx help)", ErrUsage, cmd)
 	}
+	if errors.Is(err, flag.ErrHelp) { // -h / --help en un subcomando
+		usage(stdout)
+		return exitOK
+	}
 	if err != nil && !errors.Is(err, errDiffs) {
 		fmt.Fprintf(stderr, "vx: %v\n", err)
 	}
@@ -84,34 +89,51 @@ func run(args []string, in io.Reader, stdout, stderr io.Writer) int {
 }
 
 func usage(w io.Writer) {
-	fmt.Fprint(w, `Vextra — transferencia y sincronización de archivos sobre SSH  (binario: vextra; alias: vx)
+	fmt.Fprint(w, `Vextra — transferencia y sincronización de archivos sobre SSH
+Binario: vextra (alias: vx)
 
 Uso:
-  vx connect [usuario@]host            shell interactivo (ls cd get put sync diff ...)
-  vx put  ORIGEN [usuario@]host:DEST   copia local -> remoto
-  vx get  [usuario@]host:ORIGEN DEST   copia remoto -> local
-  vx sync ORIGEN DESTINO               espejo unidireccional (en cualquier dirección, o local-local)
+  vx connect DESTINO                   shell interactivo (ls, cd, get, put, sync, diff...)
+  vx put  ORIGEN [usuario@]host:RUTA   copia local -> remoto
+  vx get  [usuario@]host:RUTA DESTINO  copia remoto -> local
+  vx sync ORIGEN DESTINO               espejo unidireccional (--delete para borrar sobrantes)
   vx diff ORIGEN DESTINO               muestra qué cambiaría, sin tocar nada
   vx config show                       configuración efectiva
-  vx install-remote [usuario@]host     copia este binario a ~/.local/bin/vextra del remoto
+  vx install-remote DESTINO            copia este binario a ~/.local/bin/vextra del remoto
   vx version
 
-Opciones (put/get/sync/diff):
+En connect e install-remote, DESTINO es [usuario@]host, un alias de ~/.ssh/config
+o un comando ssh completo entre comillas:
+  vx connect "ssh -p 2222 -i ~/.ssh/k -J bastion usuario@host"
+
+Opciones de copia (put, get, sync, diff):
   -n, --dry-run        no modifica nada; muestra el plan
-      --delete         (sync/diff) borra en destino lo que no está en origen
+      --delete         (sync, diff) borra en destino lo que no está en origen
       --max-delete N   aborta si hay más de N borrados (0 = ninguno, -1 = sin límite)
   -y, --yes            no pide confirmación ante borrados masivos
       --workers N      archivos en paralelo (por defecto: auto)
       --block-size S   tamaño de bloque del delta (por defecto 1MiB)
-      --bwlimit S      límite de ancho de banda, p. ej. 20MiB (por segundo)
+      --bwlimit S      límite de ancho de banda por segundo, p. ej. 20MiB
       --no-compress    no comprime
       --no-resume      no reutiliza temporales de corridas interrumpidas
-      --ssh CMD        comando ssh a usar, p. ej. "ssh -p 2222 -i ~/.ssh/k"  (o $VX_SSH)
-      --remote-root D  el agente remoto sólo puede tocar rutas dentro de D
-      --config FILE    archivo de configuración (o $VX_CONFIG)
+      --exit-code      (diff) sale con código 10 si hay diferencias
   -v, --verbose        lista cada archivo procesado
   -q, --quiet          sin progreso ni resumen
-      --exit-code      (diff) sale con código 10 si hay diferencias
+
+Conexión SSH (todos los comandos que se conectan):
+  -p, --port N         puerto
+  -i, --identity FILE  clave privada
+  -J, --jump HOST      salto por un bastión
+  -l USUARIO           usuario
+  -F FILE              archivo de configuración de ssh
+  -o CLAVE=VALOR       opción de ssh (repetible)
+      --ssh CMD        comando ssh completo, p. ej. "ssh -p 2222"
+                       (o $VX_SSH, o la clave ssh: del archivo de configuración)
+  Lo escrito en la línea de comandos gana sobre $VX_SSH y la configuración.
+
+Otras:
+      --remote-root D  el agente remoto sólo puede tocar rutas dentro de D
+      --config FILE    archivo de configuración (o $VX_CONFIG)
 
 Códigos de salida: 0 ok · 1 error · 2 uso · 3 conexión · 4 integridad · 5 salvaguarda · 6 parcial · 10 diff
 Rutas remotas: [usuario@]host:ruta   (relativas al home del usuario remoto)
@@ -120,13 +142,34 @@ Rutas remotas: [usuario@]host:ruta   (relativas al home del usuario remoto)
 
 // ------------------------------------------------------------------ flags
 
+// xferFlags agrupa los flags compartidos por put, get, sync, diff, connect e
+// install-remote. Cada comando registra sólo el subconjunto que le corresponde.
 type xferFlags struct {
-	dry, del, yes, verbose, quiet, noCompress, noResume, exitCode bool
-	maxDelete, workers                                            int
-	blockSize, bwlimit, ssh, remoteRoot, configPath               string
-	set                                                           map[string]bool
+	// Copia.
+	dry, del, yes, verbose, quiet bool
+	noCompress, noResume          bool
+	exitCode                      bool
+	maxDelete, workers            int
+	blockSize, bwlimit            string
+	remoteRoot, configPath        string
+
+	// Conexión SSH.
+	ssh                         string
+	port, identity, jump, login string
+	sshCfg                      string
+	sshOpts                     multiFlag
+
+	// set registra qué flags escribió el usuario: sólo esos pisan a la configuración.
+	set map[string]bool
 }
 
+// multiFlag es un flag repetible (-o A=1 -o B=2).
+type multiFlag []string
+
+func (m *multiFlag) String() string     { return strings.Join(*m, ",") }
+func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }
+
+// register declara los flags de copia. Cada comando recibe sólo los suyos.
 func (x *xferFlags) register(fl *flag.FlagSet, cmd string) {
 	fl.BoolVar(&x.dry, "n", false, "")
 	fl.BoolVar(&x.dry, "dry-run", false, "")
@@ -144,13 +187,80 @@ func (x *xferFlags) register(fl *flag.FlagSet, cmd string) {
 	fl.StringVar(&x.bwlimit, "bwlimit", "", "")
 	fl.BoolVar(&x.noCompress, "no-compress", false, "")
 	fl.BoolVar(&x.noResume, "no-resume", false, "")
-	fl.StringVar(&x.ssh, "ssh", "", "")
 	fl.StringVar(&x.remoteRoot, "remote-root", "", "")
 	fl.StringVar(&x.configPath, "config", "", "")
 	fl.BoolVar(&x.verbose, "v", false, "")
 	fl.BoolVar(&x.verbose, "verbose", false, "")
 	fl.BoolVar(&x.quiet, "q", false, "")
 	fl.BoolVar(&x.quiet, "quiet", false, "")
+}
+
+// registerSSH declara los flags de conexión, con los mismos nombres que ssh.
+func (x *xferFlags) registerSSH(fl *flag.FlagSet) {
+	fl.StringVar(&x.ssh, "ssh", "", "")
+	fl.StringVar(&x.port, "p", "", "")
+	fl.StringVar(&x.port, "port", "", "")
+	fl.StringVar(&x.identity, "i", "", "")
+	fl.StringVar(&x.identity, "identity", "", "")
+	fl.StringVar(&x.jump, "J", "", "")
+	fl.StringVar(&x.jump, "jump", "", "")
+	fl.StringVar(&x.login, "l", "", "")
+	fl.StringVar(&x.sshCfg, "F", "", "")
+	fl.Var(&x.sshOpts, "o", "")
+}
+
+// sshArgs traduce los flags de conexión a argumentos de ssh.
+func (x *xferFlags) sshArgs() []string {
+	var a []string
+	if x.port != "" {
+		a = append(a, "-p", x.port)
+	}
+	if x.identity != "" {
+		a = append(a, "-i", expandTilde(x.identity))
+	}
+	if x.jump != "" {
+		a = append(a, "-J", x.jump)
+	}
+	if x.login != "" {
+		a = append(a, "-l", x.login)
+	}
+	if x.sshCfg != "" {
+		a = append(a, "-F", expandTilde(x.sshCfg))
+	}
+	for _, o := range x.sshOpts {
+		a = append(a, "-o", o)
+	}
+	return a
+}
+
+// splitSSHTarget acepta el destino como "host", como "ssh [opciones] host"
+// (sin comillas: los flags ya los tomó registerSSH) o como un único argumento
+// entre comillas con un comando ssh completo. Devuelve el host y las opciones
+// extra que salieron de un comando pegado.
+func splitSSHTarget(pos []string) (string, []string, error) {
+	if len(pos) > 1 && pos[0] == "ssh" {
+		pos = pos[1:]
+	}
+	if len(pos) == 1 && strings.HasPrefix(pos[0], "ssh ") {
+		host, opts, err := ParseSSHCommand(pos[0])
+		if err != nil {
+			return "", nil, fmt.Errorf("%w: %v", ErrUsage, err)
+		}
+		return host, opts, nil
+	}
+	if len(pos) != 1 {
+		return "", nil, fmt.Errorf("%w: se esperaba un único destino [usuario@]host", ErrUsage)
+	}
+	return pos[0], nil, nil
+}
+
+// newSession crea la sesión de conexión. Como ssh se queda con el primer valor
+// que ve de cada opción, el orden final es: flags, opciones importadas de un
+// comando pegado y, al último, los valores por defecto ($VX_SSH / configuración).
+func newSession(cfg *Config, x *xferFlags, remoteRoot string, compress bool, pasted []string) *Session {
+	sess := NewSession(cfg, x.ssh, remoteRoot, compress)
+	sess.AddSSHOptions(append(x.sshArgs(), pasted...)...)
+	return sess
 }
 
 // parseFlags admite flags antes y después de los argumentos posicionales
@@ -179,6 +289,15 @@ func newFlagSet(name string) *flag.FlagSet {
 	fl := flag.NewFlagSet(name, flag.ContinueOnError)
 	fl.SetOutput(io.Discard)
 	return fl
+}
+
+// flagErr convierte un error de flag.Parse en un error de uso, preservando
+// flag.ErrHelp (-h / --help) para que run() muestre la ayuda en vez de un error.
+func flagErr(err error) error {
+	if errors.Is(err, flag.ErrHelp) {
+		return err
+	}
+	return fmt.Errorf("%w: %v", ErrUsage, err)
 }
 
 func buildOptions(cfg *Config, x *xferFlags, confirm func(string) bool, out, errw io.Writer) (*Options, error) {
@@ -215,6 +334,8 @@ func buildOptions(cfg *Config, x *xferFlags, confirm func(string) bool, out, err
 	return o, nil
 }
 
+// confirmFunc devuelve la función que pregunta al usuario, o nil si no hay
+// forma de preguntar (stdin no es una terminal y no se pasó --yes).
 func confirmFunc(yes bool, in io.Reader, w io.Writer) func(string) bool {
 	if yes {
 		return func(string) bool { return true }
@@ -237,13 +358,10 @@ func cmdTransfer(cmd string, args []string, in io.Reader, stdout, stderr io.Writ
 	fl := newFlagSet(cmd)
 	x := &xferFlags{}
 	x.register(fl, cmd)
+	x.registerSSH(fl)
 	pos, err := parseFlags(fl, args, x)
-	if errors.Is(err, flag.ErrHelp) {
-		usage(stdout)
-		return nil
-	}
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrUsage, err)
+		return flagErr(err)
 	}
 	if len(pos) != 2 {
 		return fmt.Errorf("%w: uso: vx %s ORIGEN DESTINO", ErrUsage, cmd)
@@ -265,7 +383,7 @@ func cmdTransfer(cmd string, args []string, in io.Reader, stdout, stderr io.Writ
 	if err != nil {
 		return err
 	}
-	sess := NewSession(cfg, x.ssh, x.remoteRoot, cfg.Compression != "off" && !x.noCompress)
+	sess := newSession(cfg, x, x.remoteRoot, cfg.Compression != "off" && !x.noCompress, nil)
 	defer sess.Close()
 	srcFS, err := sess.FS(srcEP)
 	if err != nil {
@@ -289,24 +407,28 @@ func cmdTransfer(cmd string, args []string, in io.Reader, stdout, stderr io.Writ
 func cmdConnect(args []string, in io.Reader, stdout, stderr io.Writer) error {
 	fl := newFlagSet("connect")
 	x := &xferFlags{}
-	fl.StringVar(&x.ssh, "ssh", "", "")
+	x.registerSSH(fl)
 	fl.StringVar(&x.remoteRoot, "remote-root", "", "")
 	fl.StringVar(&x.configPath, "config", "", "")
 	fl.BoolVar(&x.noCompress, "no-compress", false, "")
 	pos, err := parseFlags(fl, args, nil)
-	if err != nil {
-		return fmt.Errorf("%w: %v", ErrUsage, err)
+	if errors.Is(err, flag.ErrHelp) {
+		return err
 	}
-	if len(pos) != 1 {
-		return fmt.Errorf("%w: uso: vx connect [usuario@]host", ErrUsage)
+	if err != nil {
+		return fmt.Errorf("%w: %v (si pegás un comando ssh con otras opciones, ponelo entre comillas)", ErrUsage, err)
+	}
+	host, pasted, err := splitSSHTarget(pos)
+	if err != nil {
+		return err
 	}
 	cfg, err := LoadConfig(x.configPath)
 	if err != nil {
 		return err
 	}
-	sess := NewSession(cfg, x.ssh, x.remoteRoot, cfg.Compression != "off" && !x.noCompress)
+	sess := newSession(cfg, x, x.remoteRoot, cfg.Compression != "off" && !x.noCompress, pasted)
 	defer sess.Close()
-	return RunShell(sess, pos[0], in, stdout, stderr)
+	return RunShell(sess, host, in, stdout, stderr)
 }
 
 func cmdConfig(args []string, stdout io.Writer) error {
@@ -314,12 +436,12 @@ func cmdConfig(args []string, stdout io.Writer) error {
 		return fmt.Errorf("%w: uso: vx config show", ErrUsage)
 	}
 	fl := newFlagSet("config")
-	x := &xferFlags{}
-	fl.StringVar(&x.configPath, "config", "", "")
+	var cfgPath string
+	fl.StringVar(&cfgPath, "config", "", "")
 	if _, err := parseFlags(fl, args[1:], nil); err != nil {
-		return fmt.Errorf("%w: %v", ErrUsage, err)
+		return flagErr(err)
 	}
-	cfg, err := LoadConfig(x.configPath)
+	cfg, err := LoadConfig(cfgPath)
 	if err != nil {
 		return err
 	}
@@ -334,7 +456,7 @@ func cmdAgent(args []string, in io.Reader, stdout io.Writer) error {
 	var root string
 	fl.StringVar(&root, "root", "", "")
 	if _, err := parseFlags(fl, args, nil); err != nil {
-		return fmt.Errorf("%w: %v", ErrUsage, err)
+		return flagErr(err)
 	}
 	home, _ := os.UserHomeDir()
 	base := home
@@ -351,18 +473,20 @@ func cmdAgent(args []string, in io.Reader, stdout io.Writer) error {
 func cmdInstallRemote(args []string) error {
 	fl := newFlagSet("install-remote")
 	x := &xferFlags{}
-	fl.StringVar(&x.ssh, "ssh", "", "")
+	x.registerSSH(fl)
 	fl.StringVar(&x.configPath, "config", "", "")
 	pos, err := parseFlags(fl, args, nil)
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrUsage, err)
+		return flagErr(err)
 	}
-	if len(pos) != 1 {
-		return fmt.Errorf("%w: uso: vx install-remote [usuario@]host", ErrUsage)
+	host, pasted, err := splitSSHTarget(pos)
+	if err != nil {
+		return err
 	}
 	cfg, err := LoadConfig(x.configPath)
 	if err != nil {
 		return err
 	}
-	return installRemote(NewSession(cfg, x.ssh, "", false).SSH, pos[0])
+	sess := newSession(cfg, x, "", false, pasted)
+	return installRemote(sess.SSH, host)
 }

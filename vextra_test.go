@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -420,5 +421,109 @@ func TestParsersAndHelpers(t *testing.T) {
 	args, err := splitArgs(`put "mi archivo.txt" 'otro dir'/x  a\ b`)
 	if err != nil || len(args) != 4 || args[1] != "mi archivo.txt" || args[2] != "otro dir/x" || args[3] != "a b" {
 		t.Errorf("splitArgs: %q %v", args, err)
+	}
+}
+
+func TestParseSSHCommand(t *testing.T) {
+	host, opts, err := ParseSSHCommand(`ssh -p 2222 -i ~/.ssh/k -o StrictHostKeyChecking=no -t -J bastion me@srv`)
+	if err != nil || host != "me@srv" {
+		t.Fatalf("host=%q err=%v", host, err)
+	}
+	if got := strings.Join(opts, " "); got != "-p 2222 -i ~/.ssh/k -o StrictHostKeyChecking=no -J bastion" {
+		t.Fatalf("opciones: %q", got)
+	}
+	for _, bad := range []string{"ssh me@srv ls -la", "scp a b", "ssh -p", "", "ssh"} {
+		if _, _, err := ParseSSHCommand(bad); err == nil {
+			t.Errorf("ParseSSHCommand(%q) debería fallar", bad)
+		}
+	}
+}
+
+func TestSSHFlagsToArgs(t *testing.T) {
+	fl := newFlagSet("t")
+	x := &xferFlags{}
+	x.registerSSH(fl)
+	pos, err := parseFlags(fl, []string{"ssh", "-p", "2222", "--identity", "/k", "-o", "A=1", "-o", "B=2", "me@h"}, x)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(x.sshArgs(), " "); got != "-p 2222 -i /k -o A=1 -o B=2" {
+		t.Fatalf("sshArgs: %q", got)
+	}
+	host, extra, err := splitSSHTarget(pos)
+	if err != nil || host != "me@h" || len(extra) != 0 {
+		t.Fatalf("splitSSHTarget: %q %v %v", host, extra, err)
+	}
+	host, extra, err = splitSSHTarget([]string{"ssh -p 22 -i k me@h"})
+	if err != nil || host != "me@h" || strings.Join(extra, " ") != "-p 22 -i k" {
+		t.Fatalf("comando pegado: %q %v %v", host, extra, err)
+	}
+}
+
+func TestSSHOptionPrecedence(t *testing.T) {
+	t.Setenv("VX_SSH", "") // el entorno del usuario no debe influir en el resultado
+	cfg := DefaultConfig()
+
+	// Lo explícito va antes que el comando base: ssh se queda con el primer valor.
+	s := NewSession(&cfg, "ssh -p 22 -i default", "", false)
+	s.AddSSHOptions("-p", "2222")
+	if got := strings.Join(s.SSH, " "); got != "ssh -p 2222 -p 22 -i default" {
+		t.Fatalf("AddSSHOptions: %q", got)
+	}
+	s.AddSSHOptions()
+	if got := strings.Join(s.SSH, " "); got != "ssh -p 2222 -p 22 -i default" {
+		t.Fatalf("sin opciones no debe cambiar nada: %q", got)
+	}
+
+	// Flags primero, después lo importado de un comando pegado, al final el base.
+	x := &xferFlags{port: "2222"}
+	s = newSession(&cfg, x, "", false, []string{"-i", "k"})
+	if got := strings.Join(s.SSH, " "); got != "ssh -p 2222 -i k" {
+		t.Fatalf("newSession: %q", got)
+	}
+	x = &xferFlags{ssh: "ssh -p 22", port: "2222"}
+	s = newSession(&cfg, x, "", false, []string{"-i", "k"})
+	if got := strings.Join(s.SSH, " "); got != "ssh -p 2222 -i k -p 22" {
+		t.Fatalf("newSession con --ssh: %q", got)
+	}
+}
+
+func TestCLIExitCodes(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir()) // aísla el test de una config real del usuario
+	t.Setenv("VX_CONFIG", "")
+	src, dst := t.TempDir(), t.TempDir()
+	writeFileAt(t, filepath.Join(src, "a.txt"), []byte("hola"), baseTime)
+	cli := func(args ...string) (int, string) {
+		var out, errb bytes.Buffer
+		code := run(args, strings.NewReader(""), &out, &errb)
+		return code, out.String() + errb.String()
+	}
+
+	if code, _ := cli("nope"); code != exitUsage {
+		t.Errorf("comando desconocido: código %d, se esperaba %d", code, exitUsage)
+	}
+	if code, out := cli("sync", "-h"); code != exitOK || !strings.Contains(out, "Uso:") {
+		t.Errorf("sync -h: código %d, salida %q", code, out)
+	}
+	if code, _ := cli("put", "host:/x", dst); code != exitUsage {
+		t.Errorf("put con origen remoto: código %d, se esperaba %d", code, exitUsage)
+	}
+	// Los flags pueden ir después de los posicionales.
+	if code, _ := cli("diff", src, dst, "--exit-code", "-q"); code != exitDiffs {
+		t.Errorf("diff con diferencias: código %d, se esperaba %d", code, exitDiffs)
+	}
+	if code, out := cli("sync", src, dst, "-q"); code != exitOK {
+		t.Fatalf("sync: código %d: %s", code, out)
+	}
+	if code, _ := cli("diff", src, dst, "--exit-code", "-q"); code != exitOK {
+		t.Errorf("diff sin diferencias: código %d, se esperaba %d", code, exitOK)
+	}
+	// --max-delete 0 + --delete: cualquier borrado aborta con código de salvaguarda.
+	writeFileAt(t, filepath.Join(dst, "sobrante.txt"), []byte("x"), baseTime)
+	if code, _ := cli("sync", src, dst, "--delete", "--max-delete", "0", "-q"); code != exitSafety {
+		t.Errorf("--max-delete 0: código %d, se esperaba %d", code, exitSafety)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "sobrante.txt")); err != nil {
+		t.Errorf("un aborto por salvaguarda no debe borrar nada: %v", err)
 	}
 }

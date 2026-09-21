@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"strings"
 	"time"
 )
@@ -43,7 +44,7 @@ type Session struct {
 	local      *LocalFS
 }
 
-// NewSession resuelve el comando ssh con esta precedencia: flag --ssh,
+// NewSession resuelve el comando ssh base con esta precedencia: flag --ssh,
 // variable VX_SSH, clave `ssh` de la configuración, "ssh".
 func NewSession(cfg *Config, sshFlag, remoteRoot string, compress bool) *Session {
 	cmd := sshFlag
@@ -57,10 +58,28 @@ func NewSession(cfg *Config, sshFlag, remoteRoot string, compress bool) *Session
 	if len(argv) == 0 {
 		argv = []string{"ssh"}
 	}
+	for i := range argv {
+		argv[i] = expandTilde(argv[i]) // exec no pasa por un shell: expandimos ~/ nosotros
+	}
 	return &Session{
 		Cfg: cfg, SSH: argv, RemoteRoot: remoteRoot, Compress: compress,
 		remotes: map[string]*RemoteFS{}, local: NewLocalFS("", ""),
 	}
+}
+
+// AddSSHOptions inserta opts justo después del ejecutable ssh. OpenSSH usa el
+// primer valor que ve de cada opción, así que lo agregado acá gana sobre el
+// comando base ($VX_SSH, configuración): lo explícito en la línea de comandos
+// nunca queda pisado por un valor por defecto.
+func (s *Session) AddSSHOptions(opts ...string) {
+	if len(opts) == 0 {
+		return
+	}
+	argv := make([]string, 0, len(s.SSH)+len(opts))
+	argv = append(argv, s.SSH[0])
+	argv = append(argv, opts...)
+	argv = append(argv, s.SSH[1:]...)
+	s.SSH = argv
 }
 
 // FS devuelve el sistema de archivos del extremo, conectando si es remoto.
@@ -213,4 +232,46 @@ func installRemote(sshArgv []string, host string) error {
 	}
 	fmt.Printf("instalado en %s:~/.local/bin/vextra — %s", host, out)
 	return nil
+}
+
+// ParseSSHCommand importa un comando ssh ya escrito, p. ej.
+//
+//	ssh -p 2222 -i ~/.ssh/k -J bastion usuario@host
+//
+// y devuelve el host y las opciones que hay que pasarle a ssh. Descarta las
+// opciones que romperían el agente (-t, -T, -N, -f, -n) y rechaza comandos con
+// un comando remoto al final.
+func ParseSSHCommand(cmdline string) (host string, opts []string, err error) {
+	toks, err := splitArgs(cmdline)
+	if err != nil {
+		return "", nil, err
+	}
+	if len(toks) == 0 || path.Base(toks[0]) != "ssh" {
+		return "", nil, errors.New("se esperaba un comando que empiece con ssh")
+	}
+	const withArg = "bcDEeFIiJLlmOopQRSWw" // opciones de ssh que llevan un valor aparte
+	drop := map[string]bool{"-t": true, "-tt": true, "-T": true, "-N": true, "-f": true, "-n": true}
+	i := 1
+	for ; i < len(toks); i++ {
+		t := toks[i]
+		if !strings.HasPrefix(t, "-") || t == "-" {
+			break
+		}
+		if drop[t] {
+			continue
+		}
+		opts = append(opts, t)
+		if len(t) == 2 && strings.IndexByte(withArg, t[1]) >= 0 && i+1 < len(toks) {
+			i++
+			opts = append(opts, toks[i])
+		}
+	}
+	if i >= len(toks) {
+		return "", nil, errors.New("no encontré el host en el comando ssh")
+	}
+	host = toks[i]
+	if i+1 < len(toks) {
+		return "", nil, errors.New("el comando ssh trae un comando remoto al final; pegá sólo ssh [opciones] host")
+	}
+	return host, opts, nil
 }

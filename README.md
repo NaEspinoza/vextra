@@ -43,6 +43,36 @@ esa ruta es un directorio existente. Opciones: `vx help`. Configuración opciona
 
 Códigos de salida: 0 ok · 1 error · 2 uso · 3 conexión · 4 integridad · 5 salvaguarda · 6 parcial · 10 diff.
 
+## Conexión SSH: puerto, clave, bastión, o pegar un comando ssh
+
+Todo va por el `ssh` del sistema, así que cualquiera de estas formas sirve en `connect`, `put`, `get`, `sync`, `diff` e `install-remote`:
+
+```sh
+# 1) Flags (mismos nombres que ssh)
+vx connect -p 2222 -i ~/.ssh/id_ed25519 usuario@host
+vx sync -p 2222 -i ~/.ssh/k -J bastion -o StrictHostKeyChecking=accept-new ./dir host:/srv/dir
+
+# 2) Pegar un comando ssh tal cual (entre comillas si trae opciones que vx no define)
+vx connect "ssh -p 2222 -i ~/.ssh/k -J bastion usuario@host"
+
+# 3) Alias de ~/.ssh/config (la opción más cómoda para el uso diario)
+#    Host prod / HostName 10.0.0.5 / Port 2222 / User deploy / IdentityFile ~/.ssh/prod
+vx connect prod
+vx sync ./dir prod:/srv/dir
+
+# 4) Un comando ssh por defecto: --ssh, $VX_SSH, o `ssh:` en ~/.config/vextra/config.yaml
+export VX_SSH="ssh -p 2222 -i /home/yo/.ssh/k"
+```
+
+**Precedencia.** OpenSSH se queda con el *primer* valor que ve de cada opción, así que vextra arma el comando en este
+orden: primero los flags de la línea de comandos, después las opciones de un comando pegado y al final el comando por
+defecto (`--ssh`, `$VX_SSH`, configuración). Lo que escribís en el momento siempre gana; por ejemplo, con
+`VX_SSH="ssh -p 22"`, un `--port 2222` se respeta. (`-J` es la excepción: ssh no admite dos, así que no lo repitas
+entre el comando por defecto y un flag.)
+
+Contraseñas y passphrases: `ssh` las pide directamente en tu terminal (no pasan por vextra); `ssh-agent` funciona igual.
+Al pegar un comando ssh se descartan `-t -T -N -f -n` (romperían el agente) y se rechaza si trae un comando remoto al final.
+
 ## Cómo funciona
 
 ```
