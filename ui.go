@@ -133,6 +133,10 @@ func PrintPlan(w io.Writer, p *Plan, deleteOn bool) {
 		case ActFile:
 			if a.Dst == nil || a.Replace {
 				fmt.Fprintf(w, "+ %s  (%s)\n", name, humanBytes(a.Src.Size))
+			} else if a.Delta != nil {
+				fmt.Fprintf(w, "~ %s  (%s → %s, %s) — delta: %d/%d bloques, %s a mover\n",
+					name, humanBytes(a.Dst.Size), humanBytes(a.Src.Size), a.Why,
+					a.Delta.Changed, a.Delta.Blocks, humanBytes(a.Delta.Bytes))
 			} else {
 				fmt.Fprintf(w, "~ %s  (%s → %s, %s)\n", name, humanBytes(a.Dst.Size), humanBytes(a.Src.Size), a.Why)
 			}
@@ -147,6 +151,9 @@ func PrintPlan(w io.Writer, p *Plan, deleteOn bool) {
 			fmt.Fprintf(w, "? %s  (sólo en destino; --delete lo borraría)\n", path.Clean(p.Extra[i].Path))
 		}
 	}
+	if p.Excluded > 0 {
+		fmt.Fprintf(w, "x %d entradas de origen ignoradas por --exclude\n", p.Excluded)
+	}
 }
 
 func (p *Plan) Summary() string {
@@ -159,7 +166,14 @@ func (p *Plan) Summary() string {
 		s += fmt.Sprintf(", %d sólo en destino (no se tocan)", len(p.Extra))
 	}
 	if p.Files > 0 {
-		s += fmt.Sprintf(" — hasta %s a transferir (el delta puede reducirlo)", humanBytes(p.Bytes))
+		if p.Deep {
+			s += fmt.Sprintf(" — delta real: %s de contenido a mover (de %s en archivos)", humanBytes(p.DeltaBytes), humanBytes(p.Bytes))
+		} else {
+			s += fmt.Sprintf(" — hasta %s a transferir (el delta puede reducirlo; --deep lo calcula exacto)", humanBytes(p.Bytes))
+		}
+	}
+	if p.Excluded > 0 {
+		s += fmt.Sprintf(", %d entradas ignoradas por --exclude", p.Excluded)
 	}
 	return s
 }

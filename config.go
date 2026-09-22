@@ -27,6 +27,7 @@ type Config struct {
 	SmallFile   int64
 	SSH         string
 	RemoteBin   string
+	Excludes    []string // patrones permanentes (ver excludes.go); --exclude en la línea de comandos se suman
 }
 
 func DefaultConfig() Config {
@@ -98,13 +99,20 @@ func (c *Config) parse(data string) error {
 		if j := strings.Index(line, "#"); j >= 0 {
 			line = line[:j]
 		}
-		if strings.TrimSpace(line) == "" {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
 			continue
 		}
 		indented := line[0] == ' ' || line[0] == '\t'
-		k, v, ok := strings.Cut(strings.TrimSpace(line), ":")
+		// Bajo "exclude:" cada patrón es un ítem de lista ("- patrón"), no un par
+		// "clave: valor" (un patrón como "*.log" no tiene ":" para partir).
+		if indented && section == "exclude" && strings.HasPrefix(trimmed, "- ") {
+			c.Excludes = append(c.Excludes, strings.Trim(strings.TrimSpace(trimmed[2:]), `"'`))
+			continue
+		}
+		k, v, ok := strings.Cut(trimmed, ":")
 		if !ok {
-			return fmt.Errorf("línea %d: se esperaba \"clave: valor\"", i+1)
+			return fmt.Errorf("línea %d: se esperaba \"clave: valor\" (o \"- patrón\" bajo exclude:)", i+1)
 		}
 		k = strings.TrimSpace(k)
 		v = strings.Trim(strings.TrimSpace(v), `"'`)
@@ -197,5 +205,14 @@ func (c *Config) String() string {
 	fmt.Fprintf(&b, "small_file: %s\n", cfgSize(c.SmallFile))
 	fmt.Fprintf(&b, "ssh: %s\n", c.SSH)
 	fmt.Fprintf(&b, "remote_bin: %s\n", c.RemoteBin)
+	fmt.Fprintf(&b, "exclude:")
+	if len(c.Excludes) == 0 {
+		fmt.Fprintf(&b, "   # (ninguno; se pueden sumar con --exclude / --exclude-from)\n")
+	} else {
+		fmt.Fprintf(&b, "\n")
+		for _, e := range c.Excludes {
+			fmt.Fprintf(&b, "  - %q\n", e)
+		}
+	}
 	return b.String()
 }

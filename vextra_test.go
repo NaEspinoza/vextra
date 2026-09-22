@@ -527,3 +527,204 @@ func TestCLIExitCodes(t *testing.T) {
 		t.Errorf("un aborto por salvaguarda no debe borrar nada: %v", err)
 	}
 }
+
+func TestExcludeMatching(t *testing.T) {
+	es, err := compileExcludes([]string{"*.log", "node_modules/", "cache/tmp", "", "# comentario"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		rel  string
+		typ  string
+		want bool
+	}{
+		{"a.log", TFile, true},                  // sin "/": por nombre, en la raíz
+		{"src/deep/b.log", TFile, true},          // sin "/": por nombre, a cualquier profundidad
+		{"node_modules", TDir, true},             // el directorio en sí
+		{"node_modules/pkg/index.js", TFile, true}, // heredado de un ancestro excluido
+		{"cache/tmp", TFile, true},                // anclado, coincide exacto
+		{"cache/tmpX", TFile, false},              // anclado: no es un prefijo, path.Match no matchea
+		{"cache/otro", TFile, false},
+		{"notes.txt", TFile, false},
+	}
+	for _, c := range cases {
+		if got := es.Excluded(c.rel, c.typ); got != c.want {
+			t.Errorf("Excluded(%q, %q) = %v, se esperaba %v", c.rel, c.typ, got, c.want)
+		}
+	}
+	if _, err := compileExcludes([]string{"[abc"}); err == nil {
+		t.Error("un patrón inválido debería fallar al compilar")
+	}
+	if _, err := compileExcludes([]string{"/"}); err == nil {
+		t.Error("un patrón vacío tras quitar '/' debería fallar al compilar")
+	}
+}
+
+func TestSyncWithExcludes(t *testing.T) {
+	src, dst := t.TempDir(), t.TempDir()
+	writeFileAt(t, filepath.Join(src, "keep.txt"), []byte("k"), baseTime)
+	writeFileAt(t, filepath.Join(src, "debug.log"), []byte("d"), baseTime)
+	writeFileAt(t, filepath.Join(src, "node_modules/pkg/index.js"), []byte("x"), baseTime)
+	// Lo excluido que ya está en destino no se borra ni con --delete.
+	writeFileAt(t, filepath.Join(dst, "debug.log"), []byte("viejo"), baseTime)
+
+	es, err := compileExcludes([]string{"*.log", "node_modules/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := NewLocalFS("", "")
+	o := testOpts()
+	o.Exclude = es
+	o.Delete = true
+
+	plan, err := BuildPlan(l, src, l, dst, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Excluded == 0 {
+		t.Error("Plan.Excluded debería contar las entradas de origen ignoradas")
+	}
+	for _, a := range plan.Actions {
+		if strings.Contains(a.Rel, ".log") || strings.Contains(a.Rel, "node_modules") {
+			t.Errorf("acción inesperada sobre una ruta excluida: %+v", a)
+		}
+	}
+	for _, e := range plan.Extra {
+		if strings.Contains(e.Path, ".log") {
+			t.Errorf("una ruta excluida no debería listarse para borrar: %+v", e)
+		}
+	}
+
+	if _, err := Run(l, src, l, dst, o, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "keep.txt")); err != nil {
+		t.Errorf("keep.txt debería haberse copiado: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "node_modules")); err == nil {
+		t.Error("node_modules no debería haberse copiado")
+	}
+	got, err := os.ReadFile(filepath.Join(dst, "debug.log"))
+	if err != nil || string(got) != "viejo" {
+		t.Errorf("debug.log excluido no debería tocarse: %q, %v", got, err)
+	}
+}
+
+func TestDirectoryMTimePreserved(t *testing.T) {
+	src, dst := t.TempDir(), t.TempDir()
+	dirTime := baseTime.Add(-48 * time.Hour)
+	writeFileAt(t, filepath.Join(src, "sub/a.txt"), []byte("a"), baseTime)
+	if err := os.Chtimes(filepath.Join(src, "sub"), dirTime, dirTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(src, dirTime, dirTime); err != nil {
+		t.Fatal(err)
+	}
+	l := NewLocalFS("", "")
+	if _, err := Run(l, src, l, dst, testOpts(), false, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{dst, filepath.Join(dst, "sub")} {
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !fi.ModTime().Equal(dirTime) {
+			t.Errorf("%s: mtime = %v, se esperaba %v (crear el archivo adentro no debería pisarlo)", p, fi.ModTime(), dirTime)
+		}
+	}
+}
+
+func TestAdaptiveBlockSize(t *testing.T) {
+	cases := []struct{ size int64 }{{100 << 10}, {50 << 20}, {2 << 30}}
+	for _, c := range cases {
+		bs := blockSizeFor(c.size, 0)
+		if bs < minBlockSize || bs > maxBlockSize {
+			t.Errorf("blockSizeFor(%d) = %d, fuera de [%d, %d]", c.size, bs, minBlockSize, maxBlockSize)
+		}
+		if bs&(bs-1) != 0 {
+			t.Errorf("blockSizeFor(%d) = %d, no es potencia de dos", c.size, bs)
+		}
+	}
+	if bs := blockSizeFor(999<<20, 128<<10); bs != 128<<10 {
+		t.Errorf("un tamaño fijo debe respetarse: %d", bs)
+	}
+	// Con un tamaño de bloque más chico para un archivo grande, editar un 1%
+	// debería tocar muchos menos bloques que con el 1MiB fijo de antes.
+	if bs := blockSizeFor(64<<20, 0); bs >= 1<<20 {
+		t.Errorf("un archivo de 64MiB debería usar un bloque adaptativo menor a 1MiB, dio %d", bs)
+	}
+}
+
+func TestDeepDiffMatchesRealTransfer(t *testing.T) {
+	src, dst := t.TempDir(), t.TempDir()
+	big := randBytes(20<<20, 11)
+	sp := filepath.Join(src, "big.bin")
+	writeFileAt(t, sp, big, baseTime)
+	l := NewLocalFS("", "")
+	o := testOpts()
+	if _, err := Run(l, src, l, dst, o, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	// Editar ~1% del archivo.
+	edit := len(big) / 100
+	for i := 0; i < edit; i++ {
+		big[1<<20+i] ^= 0xFF
+	}
+	writeFileAt(t, sp, big, baseTime.Add(time.Minute))
+
+	o.Deep = true
+	res, err := Run(l, src, l, dst, o, true, nil) // dry-run con --deep
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Plan.Deep || res.Plan.DeltaBytes == 0 {
+		t.Fatalf("se esperaba un delta calculado y no nulo: %+v", res.Plan)
+	}
+	if res.Plan.DeltaBytes >= res.Plan.Bytes {
+		t.Fatalf("editar ~1%% debería estimar mucho menos que el archivo completo: delta=%d bytes=%d",
+			res.Plan.DeltaBytes, res.Plan.Bytes)
+	}
+	estimated := res.Plan.DeltaBytes
+
+	o.Deep = false
+	real, err := Run(l, src, l, dst, o, false, nil) // corrida real
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := real.Stats.SentBytes.Load(); got != estimated {
+		t.Fatalf("--deep estimó %d bytes pero la corrida real movió %d", estimated, got)
+	}
+	if got := real.Stats.SentBytes.Load(); float64(got) > float64(len(big))*0.05 {
+		t.Fatalf("editar ~1%% no debería mover más de un 5%% del archivo: %d de %d bytes", got, len(big))
+	}
+}
+
+func TestBuildExcludes(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Excludes = []string{"*.bak"}
+	dir := t.TempDir()
+	ff := filepath.Join(dir, "excl.txt")
+	if err := os.WriteFile(ff, []byte("*.tmp\n# comentario\n\nnode_modules/\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	x := &xferFlags{excludeFrom: ff, excludes: multiFlag{"*.log"}}
+	ex, err := buildExcludes(&cfg, x)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"a.bak", "a.tmp", "a.log"} {
+		if !ex.Excluded(want, TFile) {
+			t.Errorf("se esperaba que %q esté excluido (config + exclude-from + --exclude combinados)", want)
+		}
+	}
+	if ex.Excluded("a.txt", TFile) {
+		t.Error("a.txt no debería estar excluido")
+	}
+	if _, err := buildExcludes(&cfg, &xferFlags{excludeFrom: "/no/existe"}); err == nil {
+		t.Error("--exclude-from con un archivo inexistente debería fallar")
+	}
+	if ex2, err := buildExcludes(&DefaultConfig(), &xferFlags{}); err != nil || ex2 != nil {
+		t.Errorf("sin exclusiones, buildExcludes debería devolver (nil, nil): %v, %v", ex2, err)
+	}
+}

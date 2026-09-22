@@ -23,10 +23,12 @@ type Options struct {
 	Confirm     func(msg string) bool // nil = no se puede confirmar (se aborta)
 	Workers     int
 	MaxInflight int64
-	BlockSize   int
+	BlockSize   int // bytes; 0 = adaptativo según el tamaño de cada archivo
 	SmallFile   int64
 	BWLimit     int64
 	Resume      bool
+	Deep        bool        // en dry-run: calcular el delta real de cada archivo (lee ambos lados)
+	Exclude     *excludeSet // nil o vacío = no excluye nada
 	Verbose     bool
 	Quiet       bool
 	TTY         bool
@@ -56,6 +58,7 @@ type Action struct {
 	Dst     *Entry
 	Why     string
 	Replace bool
+	Delta   *DeltaInfo // sólo con --deep
 }
 
 type Plan struct {
@@ -63,7 +66,11 @@ type Plan struct {
 	Extra   []Entry // sólo en destino (se borran únicamente con --delete)
 
 	Files, NewFiles, ModFiles, Dirs, Links, Metas, Deletes int
-	Bytes                                                  int64 // suma de tamaños de archivos a transferir (cota superior)
+
+	Bytes      int64 // suma de tamaños de archivos a transferir (cota superior)
+	DeltaBytes int64 // con --deep: contenido que realmente movería el delta
+	Deep       bool  // DeltaBytes y Action.Delta fueron calculados
+	Excluded   int   // entradas de origen descartadas por --exclude
 }
 
 func (p *Plan) HasChanges() bool { return len(p.Actions) > 0 }
@@ -164,8 +171,12 @@ func classify(s, d *Entry) *Action {
 		if d.Type != TDir {
 			return &Action{Kind: ActMkdir, Why: "tipo distinto", Replace: true}
 		}
-		if d.Mode != s.Mode {
-			return &Action{Kind: ActMeta, Why: "permisos"}
+		if d.Mode != s.Mode || d.MTime != s.MTime {
+			why := "permisos"
+			if d.Mode == s.Mode {
+				why = "mtime"
+			}
+			return &Action{Kind: ActMeta, Why: why}
 		}
 	case TLink:
 		if d == nil {
@@ -265,6 +276,13 @@ func BuildPlan(src FS, srcPath string, dst FS, dstPath string, o *Options) (*Pla
 				Kind: ActMkdir, Rel: ".", SrcPath: srcPath, DstPath: dstPath, Src: sroot, Why: "nuevo",
 			})
 		}
+		if !o.Exclude.empty() {
+			before := len(slist)
+			slist = filterExcluded(slist, o.Exclude)
+			plan.Excluded += before - len(slist)
+			dlist = filterExcluded(dlist, o.Exclude) // lo excluido tampoco se borra con --delete
+		}
+
 		dmap := make(map[string]*Entry, len(dlist))
 		for i := range dlist {
 			dmap[dlist[i].Path] = &dlist[i]
@@ -332,6 +350,163 @@ func checkSafety(p *Plan, o *Options) error {
 		}
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------- delta
+
+// Tamaño de bloque adaptativo. Apuntando a ~512 bloques por archivo, editar
+// el 1% de cualquier archivo toca sólo unos pocos bloques, mientras que las
+// firmas (32 B por bloque) siguen siendo insignificantes frente al archivo.
+// Con un bloque fijo de 1 MiB, en cambio, el 1% de un archivo de 10 MiB
+// reenviaría el 10–20%.
+const (
+	minBlockSize = 64 << 10 // 64 KiB
+	maxBlockSize = 4 << 20  // 4 MiB
+	targetBlocks = 512      // bloques por archivo a los que apunta el tamaño adaptativo
+)
+
+// blockSizeFor devuelve el tamaño de bloque de un archivo: el fijo si se
+// configuró uno (fixed > 0) o, si no, una potencia de dos entre minBlockSize
+// y maxBlockSize. Depende sólo del tamaño del origen, por lo que ambos lados
+// (y una reanudación posterior) siempre coinciden.
+func blockSizeFor(size int64, fixed int) int {
+	if fixed > 0 {
+		return fixed
+	}
+	want := size / targetBlocks
+	bs := int64(minBlockSize)
+	for bs < maxBlockSize && bs < want {
+		bs <<= 1
+	}
+	return int(bs)
+}
+
+// diffBlocks compara las firmas posición por posición y devuelve los índices
+// de bloque que hay que enviar y cuántos bytes suman.
+func diffBlocks(ss, ds *Sigs, bs int, size int64) ([]int, int64) {
+	var changed []int
+	var total int64
+	for i := range ss.Blocks {
+		if !ds.Exists || i >= len(ds.Blocks) || ds.Blocks[i] != ss.Blocks[i] {
+			changed = append(changed, i)
+			total += minInt64(int64(bs), size-int64(i)*int64(bs))
+		}
+	}
+	return changed, total
+}
+
+// DeltaInfo es la estimación (con --deep) de lo que movería el delta de un archivo.
+type DeltaInfo struct {
+	BS      int   // tamaño de bloque usado
+	Blocks  int   // bloques del origen
+	Changed int   // bloques que hay que enviar
+	Bytes   int64 // contenido a enviar (suma de los bloques distintos)
+	Same    bool  // el contenido ya es idéntico: sólo se actualizan metadatos
+	Resume  bool  // se reutilizaría un temporal parcial de una corrida interrumpida
+}
+
+// loadSigs obtiene las firmas del origen y del destino (del archivo final o
+// del temporal reanudable) en paralelo: cada una se calcula donde vive el
+// archivo, así que en put/get el trabajo de hash se reparte entre las dos
+// máquinas en vez de sumarse.
+func (e *Engine) loadSigs(a *Action, job string, bs int) (*Sigs, *Sigs, error) {
+	var (
+		ds   *Sigs
+		derr error
+		wg   sync.WaitGroup
+	)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ds, derr = e.dst.Sigs(a.DstPath, job, bs)
+	}()
+	ss, serr := e.src.Sigs(a.SrcPath, "", bs)
+	wg.Wait()
+	if serr != nil {
+		return nil, nil, serr
+	}
+	if derr != nil {
+		return nil, nil, derr
+	}
+	return ss, ds, nil
+}
+
+// estimate calcula el delta de un archivo con las mismas decisiones que la
+// transferencia real (mismo tamaño de bloque, mismo temporal reanudable).
+func (e *Engine) estimate(a *Action) (*DeltaInfo, error) {
+	size := a.Src.Size
+	bs := blockSizeFor(size, e.o.BlockSize)
+	job := jobID(a.DstPath, size, a.Src.MTime, e.o.Resume)
+	ss, ds, err := e.loadSigs(a, job, bs)
+	if err != nil {
+		return nil, err
+	}
+	if !ss.Exists || ss.Size != size {
+		return nil, errChanged(a)
+	}
+	changed, total := diffBlocks(ss, ds, bs, size)
+	return &DeltaInfo{
+		BS:      bs,
+		Blocks:  len(ss.Blocks),
+		Changed: len(changed),
+		Bytes:   total,
+		Same:    len(changed) == 0 && ds.Exists && ds.Kind == "final" && ds.Size == size,
+		Resume:  ds.Exists && ds.Kind == "tmp",
+	}, nil
+}
+
+// EstimateDeltas completa Action.Delta y Plan.DeltaBytes leyendo las firmas de
+// ambos lados de los archivos grandes ya existentes en destino (es lo que
+// muestra `vx diff --deep`). Los archivos chicos y los nuevos se cuentan
+// completos, sin leerlos: para los nuevos es una cota superior, porque una
+// reanudación pendiente sólo podría reducirla.
+func EstimateDeltas(src, dst FS, plan *Plan, o *Options) error {
+	e := &Engine{src: src, dst: dst, o: o}
+	var todo []*Action
+	for i := range plan.Actions {
+		a := &plan.Actions[i]
+		if a.Kind != ActFile {
+			continue
+		}
+		if a.Src.Size <= o.SmallFile || a.Dst == nil || a.Replace {
+			plan.DeltaBytes += a.Src.Size
+			continue
+		}
+		todo = append(todo, a)
+	}
+
+	workers := o.Workers
+	if workers < 1 {
+		workers = 1
+	}
+	var (
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		firstErr error
+	)
+	sem := make(chan struct{}, workers)
+	for _, a := range todo {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(a *Action) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			info, err := e.estimate(a)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("%s: %w", displayName(a), err)
+				}
+				return
+			}
+			a.Delta = info
+			plan.DeltaBytes += info.Bytes
+		}(a)
+	}
+	wg.Wait()
+	plan.Deep = firstErr == nil
+	return firstErr
 }
 
 // ---------------------------------------------------------------- ejecución
@@ -405,27 +580,16 @@ func (e *Engine) transferSmall(a *Action, job string) error {
 }
 
 func (e *Engine) transferLarge(a *Action, job string) error {
-	bs := e.o.BlockSize
 	size := a.Src.Size
-	ss, err := e.src.Sigs(a.SrcPath, "", bs)
+	bs := blockSizeFor(size, e.o.BlockSize)
+	ss, ds, err := e.loadSigs(a, job, bs)
 	if err != nil {
 		return err
 	}
 	if !ss.Exists || ss.Size != size {
 		return errChanged(a)
 	}
-	ds, err := e.dst.Sigs(a.DstPath, job, bs)
-	if err != nil {
-		return err
-	}
-	var changed []int
-	var changedBytes int64
-	for i := range ss.Blocks {
-		if !ds.Exists || i >= len(ds.Blocks) || ds.Blocks[i] != ss.Blocks[i] {
-			changed = append(changed, i)
-			changedBytes += minInt64(int64(bs), size-int64(i)*int64(bs))
-		}
-	}
+	changed, changedBytes := diffBlocks(ss, ds, bs, size)
 
 	// Mismo contenido que el archivo final: sólo metadatos.
 	if len(changed) == 0 && ds.Exists && ds.Kind == "final" && ds.Size == size {
@@ -577,7 +741,7 @@ func (e *Engine) Execute(plan *Plan) (*Stats, []Failure, error) {
 		e.stats.Failed.Add(1)
 	}
 
-	var work, metas, dels []*Action
+	var work, metas, dels, dirTouch []*Action
 	for i := range plan.Actions {
 		a := &plan.Actions[i]
 		switch a.Kind {
@@ -593,10 +757,15 @@ func (e *Engine) Execute(plan *Plan) (*Stats, []Failure, error) {
 				continue
 			}
 			e.stats.Dirs.Add(1)
+			dirTouch = append(dirTouch, a) // el mtime se fija al final (ver más abajo)
 		case ActFile, ActLink:
 			work = append(work, a)
 		case ActMeta:
-			metas = append(metas, a)
+			if a.Src.Type == TDir {
+				dirTouch = append(dirTouch, a)
+			} else {
+				metas = append(metas, a)
+			}
 		case ActDelete:
 			dels = append(dels, a)
 		}
@@ -658,6 +827,16 @@ func (e *Engine) Execute(plan *Plan) (*Stats, []Failure, error) {
 		}
 	}
 
+	// El mtime de los directorios se fija al final: crear, escribir o borrar
+	// un archivo adentro les actualiza el mtime, así que hacerlo antes se
+	// perdería. El orden entre directorios no importa (tocar uno no afecta
+	// al mtime de otro, sólo agregar/quitar una entrada lo hace).
+	for _, a := range dirTouch {
+		if err := e.dst.SetMeta(a.DstPath, a.Src.Mode, a.Src.MTime); err != nil {
+			addFail(a, err)
+		}
+	}
+
 	if len(fails) > 0 {
 		return e.stats, fails, ErrPartial
 	}
@@ -673,6 +852,11 @@ func Run(src FS, srcPath string, dst FS, dstPath string, o *Options, dryRun bool
 	}
 	res := &Result{Plan: plan}
 	if dryRun {
+		if o.Deep {
+			if err := EstimateDeltas(src, dst, plan, o); err != nil {
+				return res, fmt.Errorf("estimando el delta: %w", err)
+			}
+		}
 		PrintPlan(o.Out, plan, o.Delete)
 		if !o.Quiet {
 			fmt.Fprintln(o.Err, plan.Summary())

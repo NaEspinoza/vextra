@@ -3,7 +3,7 @@ LDFLAGS := -s -w -X main.version=$(VERSION)
 GOFLAGS := -trimpath
 PREFIX  ?= /usr/local
 
-.PHONY: build test vet dist install demo clean
+.PHONY: build test vet dist install demo bench clean
 
 build:
 	CGO_ENABLED=0 go build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o vextra .
@@ -31,6 +31,11 @@ install: build
 
 demo: build
 	./scripts/demo.sh
+
+# vx vs rsync vs scp (fase 3: "medido"). Sin HOST=, corre en esta máquina sin
+# red real: compara trabajo, no ancho de banda. Ver "Rendimiento" en el README.
+bench: build
+	./scripts/bench.sh
 
 clean:
 	rm -rf vextra dist
