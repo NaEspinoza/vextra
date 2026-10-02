@@ -4,10 +4,34 @@ Transferencia y sincronización de archivos sobre SSH para Linux: un binario est
 (solo stdlib de Go). Comando: **`vextra`**, con alias corto **`vx`** (el instalador no pisa un `vx` ajeno;
 en el remoto el agente siempre se invoca como `vextra`, así que un `vx` de otro paquete nunca interfiere).
 
-> **Estado de verificación:** este código se escribió en un entorno sin compilador Go ni red, así que
-> **no fue compilado ni ejecutado todavía**. Se revisó a mano y con un verificador estático (imports,
+> **Estado de verificación:** el código Go se escribió en un entorno sin compilador Go ni red, así que
+> **no fue compilado ni ejecutado todavía** — se revisó a mano y con un verificador estático (imports,
 > variables sin uso, brackets, aridad de llamadas). El primer paso es `make test` (ver abajo); si algo no
-> compila o falla un test, pegá la salida y se corrige.
+> compila o falla un test, pegá la salida y se corrige. `install.sh`, en cambio, **sí se probó de punta a
+> punta** en ese mismo entorno (tiene `dash`, `curl` y `sha256sum`, aunque no red real): instalación local,
+> instalación remota contra un release HTTP simulado, checksum correcto e incorrecto (debe abortar sin
+> instalar nada), reinstalación, y la protección de un `vx` ajeno — los siete casos pasaron. Lo único que
+> ese script no pudo probar es GitHub real (`.github/workflows/release.yml` tampoco corrió nunca: no hay
+> forma de ejecutar GitHub Actions desde este entorno).
+
+## Instalación
+
+```sh
+# Con un release ya publicado (ver "Empaquetado" más abajo):
+curl -fsSL https://raw.githubusercontent.com/usuario/vextra/HEAD/install.sh | REPO=usuario/vextra sh
+
+# Sin sudo, a la cuenta del usuario:
+curl -fsSL .../install.sh | REPO=usuario/vextra PREFIX=$HOME/.local sh
+
+# Una versión puntual en vez de la última:
+curl -fsSL .../install.sh | REPO=usuario/vextra VERSION=v0.2.0 sh
+```
+
+Detecta la arquitectura (amd64/arm64/armv7), descarga `vextra-linux-<arch>` del release de GitHub indicado en
+`REPO`, **verifica su checksum contra `SHA256SUMS`** antes de instalar nada, y deja `vextra` (con el alias
+`vx`, salvo que ya exista otro programa con ese nombre) en `$PREFIX/bin` (`/usr/local` por defecto). Necesita
+`curl` o `wget`. Es un solo binario copiado a un directorio — no hay que confiar ciegamente en el `| sh`: se
+puede bajar el script, leerlo, y correrlo después (`curl -fsSLo install.sh ... && less install.sh && sh install.sh`).
 
 ## Compilar, probar, demo
 
@@ -18,12 +42,25 @@ make build            # ./vextra  (estático, CGO_ENABLED=0)
 make demo             # sync, delta, reanudación y salvaguardas; "remoto" simulado en tu máquina
 HOST=usuario@servidor ./scripts/demo.sh    # la misma demo contra un servidor real
 make bench             # vx vs rsync vs scp: copia en frío, sin cambios, delta ~1% (ver "Rendimiento" abajo)
-make dist             # dist/vextra-linux-{amd64,arm64,armv7}
-sudo make install     # /usr/local/bin/vextra (+ alias vx si el nombre está libre)
+make dist             # dist/vextra-linux-{amd64,arm64,armv7} + dist/SHA256SUMS
+sudo make install     # instalación local: /usr/local/bin/vextra (+ alias vx si el nombre está libre)
 ```
 
 Contra un servidor real, el remoto necesita el binario `vextra` (mismo mecanismo que rsync):
 `vx install-remote usuario@servidor` lo copia a `~/.local/bin/vextra` (misma arquitectura; si no, usá `make dist`).
+
+## Empaquetado y releases
+
+`make dist` genera los tres binarios más `SHA256SUMS`. `.github/workflows/release.yml` (nuevo, sin correr
+todavía) hace lo mismo en CI y los publica como un release de GitHub cada vez que se pushea un tag `vX.Y.Z`:
+
+```sh
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+Eso es lo que necesita `REPO=usuario/vextra` de la sección "Instalación" de arriba para tener algo real de
+donde descargar — sin un release publicado, el `curl | sh` remoto falla con un mensaje explícito (404), no
+en silencio.
 
 ## Uso
 
@@ -116,7 +153,7 @@ por ejemplo, dejar un `.git/` o unos logs locales del lado del destino sin que u
 Un archivo pasado como origen explícito (`vx get host:/etc/passwd ./x`) no pasa por los filtros: sólo aplican
 al recorrer un árbol.
 
-## Rendimiento (fase 3)
+## Rendimiento (fase 3) — ABIERTA, no se puede cerrar desde acá
 
 Lo que ya construye la fase 3 de la spec: **compresión adaptativa** (arriba) y **concurrencia acotada**
 (`workers`, `max_inflight`, `--bwlimit`) vienen desde el primer commit; el bloque de delta adaptativo (arriba)
@@ -139,7 +176,11 @@ contra una red de verdad para que el número tenga sentido.
 **Estado honesto:** el script está escrito y probé su lógica de parseo (tiempo, bytes de `--stats`) con datos de
 muestra, pero no lo corrí de punta a punta: este entorno no tiene `rsync`, `scp` ni `ssh` instalados, ni red. No
 hay ningún número real todavía — hace falta que alguien lo corra. Tampoco se migró a BLAKE3/zstd (siguen
-SHA-256/DEFLATE; ver la tabla de abajo), así que el resultado de hoy no refleja el rendimiento final esperado.
+SHA-256/DEFLATE; ver la tabla de abajo), así que el resultado de hoy no reflejaría el rendimiento final esperado
+aunque se corriera. **Esta fase no se puede dar por cerrada sin ese paso** — no es código que falte, es una
+medición que sólo se puede hacer fuera de este entorno. El camino: alguien con Go + rsync + scp + red real
+corre `make bench` (con `HOST=`), y en base a eso se decide si BLAKE3/zstd son necesarios antes de cerrarla o
+si ya alcanza.
 
 ## Backups
 
@@ -161,10 +202,30 @@ Si necesitás versionar cada corrida (un directorio por día, con hardlinks a lo
 `vx sync --delete` encima, o un destino distinto por fecha); ese patrón queda anotado como una posible mejora
 puntual, no como el rediseño de repositorio que la spec deja para más adelante.
 
+## Pulido (fase 4)
+
+- **Salvaguardas de borrado** (`--max-delete`, confirmación desde N borrados, nada se toca si algo falló):
+  desde el primer commit.
+- **`--dry-run` / `diff`**: desde el primer commit; `--deep` (segundo commit) lo hace exacto, no sólo una cota.
+- **Mensajes de error claros** (este commit): revisé los casos de conexión más comunes y les di un mensaje
+  específico en vez de "ssh terminó con código N" a secas — código 127 (vextra no instalado, con el comando
+  para arreglarlo), 126 (probable arquitectura equivocada o falta el `+x`), 255 (aclara que es un error de
+  ssh, no de vextra, y que el motivo ya se imprimió arriba). Si no aparece la señal del agente, el error ahora
+  muestra los primeros bytes que sí llegaron (típicamente la pista real: un prompt de contraseña, un motd, un
+  shell remoto distinto al esperado).
+- **Empaquetado multi-arch instalable con `curl | sh`** (este commit): `make dist` genera los tres binarios más
+  `SHA256SUMS`; `install.sh` los descarga y verifica antes de instalar (ver "Instalación" arriba — probado de
+  punta a punta con un release HTTP simulado); `.github/workflows/release.yml` los publica en un release de
+  GitHub real al pushear un tag (sin correr nunca, ver el estado de verificación al principio).
+- **Binario liviano**: `-s -w` en el build (símbolos y debug info fuera) desde el primer commit; sin
+  dependencias de runtime al ser Go estático. Lo que no pude hacer es medir el tamaño real — no hay compilador
+  Go acá. `make dist` ya lo muestra (`ls -lh dist/`) apenas alguien lo corra.
+
 ## Cobertura de la spec y desvíos deliberados
 
 Cubierto: §3 completo salvo lo indicado abajo, §5 (shell y modo comando), §6, §7, §9, §11.2–11.4, §13, fases 0–2
-completas y buena parte de 3 (falta medir; ver "Rendimiento" arriba) y 4.
+completas, fase 3 en código completa pero **sin medir** (ver "Rendimiento" arriba — es lo único que sigue
+abierto), y fase 4 completa salvo confirmar `.github/workflows/release.yml` contra un GitHub real.
 
 | Spec | En esta build | Cómo cerrarlo |
 |---|---|---|
@@ -190,10 +251,3 @@ dispositivos se ignoran · un directorio ilegible aborta la corrida (a propósit
 confundirse con "vacío") · las exclusiones no soportan `**` ni reglas de inclusión que reviertan una exclusión
 más general (como el `!patrón` de `.gitignore`) · el shell no tiene edición de línea ni historial (usar
 `rlwrap vx connect ...`) · nombres de archivo de ~230+ bytes no admiten el sufijo del temporal.
-
-## Próximos pasos sugeridos
-
-1. Compilar y pasar `make test`. 2. `make bench` con `HOST=` contra un servidor real — el primer número real de
-la fase 3. 3. Según lo que muestre eso: BLAKE3 + zstd (probablemente lo que más impacto tenga en CPU/bytes).
-4. `--json` para automatización. 5. Transporte `x/crypto/ssh` nativo y/o fallback SFTP. 6. Si hace falta backup
-versionado de verdad: repositorio con dedup/snapshots/retención (backlog explícito de la spec, fase v4).

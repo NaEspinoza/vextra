@@ -18,24 +18,28 @@ test:
 test-race:
 	CGO_ENABLED=1 go test -race ./...
 
-# Binarios estáticos para Linux: amd64, arm64 y armv7 (Raspberry Pi, NAS...).
+# Binarios estáticos para Linux: amd64, arm64 y armv7 (Raspberry Pi, NAS...),
+# más sus checksums (SHA256SUMS: lo que install.sh verifica al instalar por
+# curl|sh, y lo que sube .github/workflows/release.yml a cada release).
 dist:
 	mkdir -p dist
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o dist/vextra-linux-amd64 .
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o dist/vextra-linux-arm64 .
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o dist/vextra-linux-armv7 .
+	cd dist && sha256sum vextra-linux-* > SHA256SUMS
 	ls -lh dist/
+	@echo; cat dist/SHA256SUMS
 
 install: build
-	PREFIX=$(PREFIX) ./install.sh ./vextra
+	PREFIX=$(PREFIX) sh ./install.sh ./vextra
 
 demo: build
-	./scripts/demo.sh
+	bash ./scripts/demo.sh
 
 # vx vs rsync vs scp (fase 3: "medido"). Sin HOST=, corre en esta máquina sin
 # red real: compara trabajo, no ancho de banda. Ver "Rendimiento" en el README.
 bench: build
-	./scripts/bench.sh
+	bash ./scripts/bench.sh
 
 clean:
 	rm -rf vextra dist

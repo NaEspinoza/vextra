@@ -113,13 +113,24 @@ func (s *Session) Close() {
 	}
 }
 
+// waitMagic lee de a un byte hasta encontrar agentMagic (descartando lo que
+// haya antes: motd, banners de shell) o hasta agotar el límite. Guarda los
+// primeros bytes vistos para poder mostrarlos si falla — suele ser la pista
+// que explica el problema (un prompt de contraseña, un error del shell remoto).
 func waitMagic(r *bufio.Reader) error {
 	want := []byte(agentMagic)
 	matched := 0
+	var seen []byte
 	for n := 0; n < 1<<20; n++ {
 		b, err := r.ReadByte()
 		if err != nil {
+			if len(seen) > 0 {
+				return fmt.Errorf("%w (se alcanzaron a leer %d bytes: %s)", err, len(seen), previewText(seen))
+			}
 			return err
+		}
+		if len(seen) < 200 {
+			seen = append(seen, b)
 		}
 		switch {
 		case b == want[matched]:
@@ -133,7 +144,32 @@ func waitMagic(r *bufio.Reader) error {
 			matched = 0
 		}
 	}
-	return errors.New("no apareció la señal del agente en el primer MiB de salida")
+	return fmt.Errorf(
+		"no apareció la señal del agente en el primer MiB de salida — posibles causas: "+
+			"ssh pidió una contraseña por stdin en vez de por la terminal, el vextra remoto es "+
+			"muy viejo (sin el comando \"agent\"), o el host de destino no es el esperado. "+
+			"Primeros bytes recibidos: %s", previewText(seen))
+}
+
+// previewText muestra bytes crudos como texto legible para un mensaje de
+// error (no imprime control chars, y corta si es largo).
+func previewText(b []byte) string {
+	if len(b) == 0 {
+		return "(nada)"
+	}
+	clean := make([]rune, 0, len(b))
+	for _, c := range string(b) {
+		if c == '\n' || c == '\t' || (c >= 0x20 && c != 0x7f) {
+			clean = append(clean, c)
+		} else {
+			clean = append(clean, '.')
+		}
+	}
+	s := strings.TrimSpace(string(clean))
+	if len(s) > 160 {
+		s = s[:160] + "…"
+	}
+	return fmt.Sprintf("%q", s)
 }
 
 func badChars(s string) bool { return strings.ContainsAny(s, "'\"$`\\") }
@@ -193,12 +229,25 @@ func DialSSH(sshArgv []string, host, root, bin string, compress bool) (*RemoteFS
 	return rfs, nil
 }
 
+// connError traduce el fallo de "ssh host vextra agent" a un mensaje
+// accionable. Los códigos de salida vienen de sh -c (ver DialSSH): 127 es
+// "comando no encontrado" (sh los usa siempre, incluso vía ssh), 126 es
+// "no se pudo ejecutar" (típicamente arquitectura equivocada o sin +x), y
+// 255 es el código genérico de ssh (fallo de red/autenticación/host key —
+// ssh ya imprimió su propio motivo arriba, en su stderr).
 func connError(waitErr error, host string, cause error) error {
 	var ee *exec.ExitError
-	if errors.As(waitErr, &ee) && ee.ExitCode() == 127 {
-		return fmt.Errorf("%w: vextra no está instalado en %s (probá: vx install-remote %s)", ErrConn, host, host)
-	}
 	if errors.As(waitErr, &ee) {
+		switch ee.ExitCode() {
+		case 127:
+			return fmt.Errorf("%w: vextra no está instalado en %s (probá: vx install-remote %s)", ErrConn, host, host)
+		case 126:
+			return fmt.Errorf("%w: el vextra de %s no se pudo ejecutar — probablemente la arquitectura no coincide "+
+				"(compilá con `make dist` y copiá el binario correcto) o le falta permiso de ejecución", ErrConn, host)
+		case 255:
+			return fmt.Errorf("%w: ssh a %s falló (código 255 = error de ssh, no de vextra; el motivo debería "+
+				"haber aparecido arriba: red, autenticación, host key)", ErrConn, host)
+		}
 		return fmt.Errorf("%w: ssh a %s terminó con código %d (%v)", ErrConn, host, ee.ExitCode(), cause)
 	}
 	return fmt.Errorf("%w: %s: %v", ErrConn, host, cause)

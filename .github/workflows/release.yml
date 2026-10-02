@@ -1,0 +1,45 @@
+name: release
+
+# Publica un release de GitHub con los binarios de `make dist` (y su
+# SHA256SUMS) cada vez que se pushea un tag "vX.Y.Z". Es lo que le da
+# contenido real al instalador remoto (install.sh vía curl | sh): sin esto,
+# REPO/releases/latest/download/vextra-linux-* no existe todavía.
+#
+# Uso:
+#   git tag v0.2.0
+#   git push origin v0.2.0
+#
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # softprops/action-gh-release necesita esto para publicar
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+
+      - name: "Compilar (make dist: amd64, arm64, armv7 + SHA256SUMS)"
+        run: make dist
+
+      - name: Smoke test del binario nativo (amd64, el arch del runner)
+        run: ./dist/vextra-linux-amd64 version
+
+      - name: Publicar el release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/vextra-linux-amd64
+            dist/vextra-linux-arm64
+            dist/vextra-linux-armv7
+            dist/SHA256SUMS
+          generate_release_notes: true

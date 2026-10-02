@@ -6,10 +6,12 @@ import (
 	"io"
 	"math/rand"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 var baseTime = time.Unix(1700000000, 0)
@@ -724,7 +726,75 @@ func TestBuildExcludes(t *testing.T) {
 	if _, err := buildExcludes(&cfg, &xferFlags{excludeFrom: "/no/existe"}); err == nil {
 		t.Error("--exclude-from con un archivo inexistente debería fallar")
 	}
-	if ex2, err := buildExcludes(&DefaultConfig(), &xferFlags{}); err != nil || ex2 != nil {
+	empty := DefaultConfig()
+	if ex2, err := buildExcludes(&empty, &xferFlags{}); err != nil || ex2 != nil {
 		t.Errorf("sin exclusiones, buildExcludes debería devolver (nil, nil): %v, %v", ex2, err)
 	}
+}
+
+func TestPreviewText(t *testing.T) {
+	if got := previewText(nil); got != "(nada)" {
+		t.Errorf("previewText(nil) = %q", got)
+	}
+	if got := previewText([]byte("hola\tmundo\n")); got != `"hola\tmundo"` {
+		t.Errorf("texto normal: %q", got)
+	}
+	// Una secuencia de escape ANSI (ESC=0x1b) no debe colarse cruda al mensaje.
+	got := previewText([]byte("\x1b[31mrojo\x1b[0m"))
+	if strings.ContainsRune(got, 0x1b) {
+		t.Errorf("un ESC crudo no debería aparecer en el mensaje: %q", got)
+	}
+	long := previewText(bytes.Repeat([]byte("x"), 500))
+	if utf8.RuneCountInString(long) > 165 {
+		t.Errorf("previewText debería cortar textos largos: %d runas", utf8.RuneCountInString(long))
+	}
+}
+
+func TestConnErrorExitCodes(t *testing.T) {
+	mkExitErr := func(code int) error {
+		_, err := exec.Command("sh", "-c", "exit "+strconvItoa(code)).Output()
+		return err
+	}
+	cases := []struct {
+		code int
+		want string
+	}{
+		{127, "no está instalado"},
+		{126, "arquitectura"},
+		{255, "error de ssh"},
+		{3, "código 3"}, // rama genérica: no hay mensaje especial para este código
+	}
+	for _, c := range cases {
+		err := connError(mkExitErr(c.code), "miserver", errors.New("causa original"))
+		if !strings.Contains(err.Error(), c.want) {
+			t.Errorf("código %d: mensaje %q no contiene %q", c.code, err.Error(), c.want)
+		}
+		if !errors.Is(err, ErrConn) {
+			t.Errorf("código %d: el error debería ser ErrConn", c.code)
+		}
+	}
+	// waitErr que no es un *exec.ExitError (p. ej. el binario ssh ni se pudo lanzar).
+	err := connError(errors.New("exec: \"ssh\": archivo no encontrado"), "miserver", errors.New("causa"))
+	if !strings.Contains(err.Error(), "miserver") || !errors.Is(err, ErrConn) {
+		t.Errorf("caso sin ExitError: %v", err)
+	}
+}
+
+func strconvItoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	var b []byte
+	for n > 0 {
+		b = append([]byte{byte('0' + n%10)}, b...)
+		n /= 10
+	}
+	if neg {
+		b = append([]byte{'-'}, b...)
+	}
+	return string(b)
 }

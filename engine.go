@@ -276,6 +276,18 @@ func BuildPlan(src FS, srcPath string, dst FS, dstPath string, o *Options) (*Pla
 				Kind: ActMkdir, Rel: ".", SrcPath: srcPath, DstPath: dstPath, Src: sroot, Why: "nuevo",
 			})
 		}
+		// El destino ya existía como directorio: a diferencia de cada entrada de
+		// slist (que si difiere se sincroniza más abajo vía classify), la raíz en
+		// sí no es parte de slist y por lo tanto nunca pasaría por ese bucle. Sin
+		// esto, su propio modo/mtime no se tocaría nunca, aunque difiriera del
+		// origen — quedaría con lo que ya tenía el directorio preexistente.
+		if dstExists {
+			if a := classify(sroot, droot); a != nil {
+				a.Rel, a.Src, a.Dst = ".", sroot, droot
+				a.SrcPath, a.DstPath = srcPath, dstPath
+				plan.Actions = append(plan.Actions, *a)
+			}
+		}
 		if !o.Exclude.empty() {
 			before := len(slist)
 			slist = filterExcluded(slist, o.Exclude)

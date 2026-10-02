@@ -117,6 +117,9 @@ Opciones de copia (put, get, sync, diff):
       --no-compress    no comprime
       --no-resume      no reutiliza temporales de corridas interrumpidas
       --exit-code      (diff) sale con código 10 si hay diferencias
+      --deep           (con -n) calcula el delta real leyendo ambos lados, no sólo una cota superior
+      --exclude PAT    no toca lo que matchee PAT (repetible; ver "Exclusiones" abajo)
+      --exclude-from F un patrón por línea, "#" comenta el resto de la línea
   -v, --verbose        lista cada archivo procesado
   -q, --quiet          sin progreso ni resumen
 
@@ -130,6 +133,12 @@ Conexión SSH (todos los comandos que se conectan):
       --ssh CMD        comando ssh completo, p. ej. "ssh -p 2222"
                        (o $VX_SSH, o la clave ssh: del archivo de configuración)
   Lo escrito en la línea de comandos gana sobre $VX_SSH y la configuración.
+
+Exclusiones (put, get, sync, diff): patrones al estilo rsync, sin "**".
+      sin "/"        coincide con el nombre en cualquier profundidad   (*.log, node_modules)
+      con "/"        se ancla a la ruta relativa desde el origen        (cache/tmp)
+      "/" al final   sólo directorios (y por lo tanto todo lo de adentro)  (.git/)
+  Se suman: exclude: de la configuración + --exclude-from + --exclude (todos aplican).
 
 Otras:
       --remote-root D  el agente remoto sólo puede tocar rutas dentro de D
@@ -147,11 +156,13 @@ Rutas remotas: [usuario@]host:ruta   (relativas al home del usuario remoto)
 type xferFlags struct {
 	// Copia.
 	dry, del, yes, verbose, quiet bool
-	noCompress, noResume          bool
+	noCompress, noResume, deep    bool
 	exitCode                      bool
 	maxDelete, workers            int
 	blockSize, bwlimit            string
 	remoteRoot, configPath        string
+	excludes                      multiFlag
+	excludeFrom                   string
 
 	// Conexión SSH.
 	ssh                         string
@@ -187,6 +198,9 @@ func (x *xferFlags) register(fl *flag.FlagSet, cmd string) {
 	fl.StringVar(&x.bwlimit, "bwlimit", "", "")
 	fl.BoolVar(&x.noCompress, "no-compress", false, "")
 	fl.BoolVar(&x.noResume, "no-resume", false, "")
+	fl.BoolVar(&x.deep, "deep", false, "")
+	fl.Var(&x.excludes, "exclude", "")
+	fl.StringVar(&x.excludeFrom, "exclude-from", "", "")
 	fl.StringVar(&x.remoteRoot, "remote-root", "", "")
 	fl.StringVar(&x.configPath, "config", "", "")
 	fl.BoolVar(&x.verbose, "v", false, "")
@@ -305,9 +319,14 @@ func buildOptions(cfg *Config, x *xferFlags, confirm func(string) bool, out, err
 		Delete: x.del, MaxDelete: cfg.MaxDelete, ConfirmMass: cfg.ConfirmMass, ConfirmOver: cfg.ConfirmOver,
 		Confirm: confirm, Workers: cfg.EffectiveWorkers(), MaxInflight: cfg.MaxInflight,
 		BlockSize: cfg.BlockSize, SmallFile: cfg.SmallFile,
-		Resume: cfg.Resume && !x.noResume, Verbose: x.verbose, Quiet: x.quiet,
+		Resume: cfg.Resume && !x.noResume, Deep: x.deep, Verbose: x.verbose, Quiet: x.quiet,
 		TTY: isTTY(os.Stderr), Out: out, Err: errw,
 	}
+	ex, err := buildExcludes(cfg, x)
+	if err != nil {
+		return nil, err
+	}
+	o.Exclude = ex
 	if x.set["max-delete"] {
 		o.MaxDelete = x.maxDelete
 	}
@@ -332,6 +351,28 @@ func buildOptions(cfg *Config, x *xferFlags, confirm func(string) bool, out, err
 		o.BWLimit = v
 	}
 	return o, nil
+}
+
+// buildExcludes junta los patrones permanentes de la configuración con los
+// de esta corrida (--exclude, --exclude-from) y los compila una sola vez.
+func buildExcludes(cfg *Config, x *xferFlags) (*excludeSet, error) {
+	pats := append([]string{}, cfg.Excludes...)
+	if x.excludeFrom != "" {
+		fromFile, err := loadExcludeFile(x.excludeFrom)
+		if err != nil {
+			return nil, fmt.Errorf("%w: --exclude-from: %v", ErrUsage, err)
+		}
+		pats = append(pats, fromFile...)
+	}
+	pats = append(pats, x.excludes...)
+	if len(pats) == 0 {
+		return nil, nil
+	}
+	ex, err := compileExcludes(pats)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrUsage, err)
+	}
+	return ex, nil
 }
 
 // confirmFunc devuelve la función que pregunta al usuario, o nil si no hay
